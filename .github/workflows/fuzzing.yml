@@ -1,0 +1,144 @@
+name: Fuzzing
+
+on:
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: write
+  pull-requests: write
+  security-events: write
+  actions: read
+
+jobs:
+  fuzz-restler:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+      - uses: py-actions/py-dependency-install@v4
+
+      - name: Create RESTler working directory
+        run: mkdir -p work
+
+      - name: Compile RESTler grammar from OpenAPI
+        run: |
+          docker run --rm -u $UID:$GID \
+            -v $PWD/swagger.json:/openapi.json:ro \
+            -v $PWD/work:/work -w /work \
+            mcr.microsoft.com/restlerfuzzer/restler:v8.5.0 \
+            dotnet /RESTler/restler/Restler.dll compile \
+              --api_spec /openapi.json
+
+      - name: Start the application
+        run: |
+          python demo_server/app.py >app.log 2>&1 &
+          sleep 1s
+
+      - name: Collect coverage
+        run: |
+          docker run --rm -u $UID:$GID --network=host \
+            -v $PWD/work:/work -w /work \
+            mcr.microsoft.com/restlerfuzzer/restler:v8.5.0 \
+            dotnet /RESTler/restler/Restler.dll test \
+              --grammar_file /work/Compile/grammar.py \
+              --dictionary_file /work/Compile/dict.json \
+              --settings /work/Compile/engine_settings.json \
+              --no_ssl
+
+      - name: Run lean fuzzing
+        run: |
+          docker run --rm -u $UID:$GID --network=host \
+            -v $PWD/work:/work -w /work \
+            mcr.microsoft.com/restlerfuzzer/restler:v8.5.0 \
+            dotnet /RESTler/restler/Restler.dll fuzz-lean \
+              --grammar_file /work/Compile/grammar.py \
+              --dictionary_file /work/Compile/dict.json \
+              --settings /work/Compile/engine_settings.json \
+              --no_ssl
+
+      - name: Run fuzzing
+        run: |
+          docker run --rm -u $UID:$GID --network=host \
+            -v $PWD/work:/work -w /work \
+            mcr.microsoft.com/restlerfuzzer/restler:v8.5.0 \
+            dotnet /RESTler/restler/Restler.dll fuzz \
+              --grammar_file /work/Compile/grammar.py \
+              --dictionary_file /work/Compile/dict.json \
+              --settings /work/Compile/engine_settings.json \
+              --no_ssl \
+              --time_budget 0.008  # 30s
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzzing-restler
+          path: |
+            app.log
+            work
+
+  fuzz-openapi-fuzzer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+      - uses: py-actions/py-dependency-install@v4
+
+      - name: Start the application
+        run: |
+          python demo_server/app.py >app.log 2>&1 &
+          sleep 1s
+
+      - name: Create openapi-fuzz working directory
+        run: mkdir -p work
+
+      - name: Run fuzzing
+        run: |
+          docker run --rm -u $UID:$GID --network=host \
+            -v $PWD/swagger.json:/openapi.json:ro \
+            -v $PWD/work:/work -w /work \
+            ghcr.io/matusf/openapi-fuzzer run \
+              --spec /openapi.json \
+              --url http://127.0.0.1:8888 \
+              --results-dir /work \
+              --skip-tls-verify \
+              --ignore-status-code 400 \
+              --ignore-status-code 404 || true
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzzing-openapi-fuzzer
+          path: |
+            app.log
+            work
+
+  publish-security-report:
+    runs-on: ubuntu-latest
+    needs: [fuzz-restler, fuzz-openapi-fuzzer]
+    steps:
+      - name: Create reports directory
+        run: mkdir -p fuzzing
+
+      - name: Download fuzzing artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: fuzzing
+          pattern: fuzzing-*
+
+      - name: Archive artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-reports-bundle
+          path: fuzzing/**
+          retention-days: 14
+
+  cleanup:
+    needs: [publish-security-report]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Remove temporary artifacts
+        uses: geekyeggo/delete-artifact@v2
+        with:
+          name: fuzzing-*
